@@ -104,6 +104,17 @@ pub fn build(b: *std.Build) void {
     mod.addImport("httpz", httpz.module("httpz"));
     mod.addImport("zmpl", zmpl.module("zmpl"));
 
+    // Re-export our dependencies under our own namespace. `zerb` exposes httpz
+    // and zmpl types in its public API, so consumers need to import the exact
+    // same module instances we were built against — declaring their own httpz
+    // or zmpl dependency would build a second copy with incompatible types.
+    //
+    // `Dependency.module` only searches modules registered in `b.modules`
+    // (which is what `addModule` writes to), so a plain `addImport` above is
+    // not enough to make `zerb_dep.module("httpz")` resolve.
+    b.modules.put(b.graph.arena, "httpz", httpz.module("httpz")) catch @panic("OOM");
+    b.modules.put(b.graph.arena, "zmpl", zmpl.module("zmpl")) catch @panic("OOM");
+
     // This declares intent for the executable to be installed into the
     // install prefix when running `zig build` (i.e. when executing the default
     // step). By default the install prefix is `zig-out/` but can be overridden
