@@ -1,31 +1,119 @@
+//! Demo application for zerb: one `.api` route, one `.htmx` route, two
+//! `.page` routes, a global middleware and a custom error mapper.
+//!
+//! Run with `zig build run`, then try:
+//!
+//!   curl -i localhost:8080/api/users/1
+//!   curl -i localhost:8080/api/users/missing
+//!   curl -i localhost:8080/users/1
+//!   curl -i -X POST localhost:8080/users/1/rename
+//!   curl -i localhost:8080/hello
+//!   curl -i localhost:8080/nope
 const std = @import("std");
-const zerb = @import("zerb");
-const zmpl = @import("zmpl").zmpl;
 const httpz = @import("httpz");
+const zerb = @import("zerb");
 
-// `helloDataFunc` only receives the request, so the io instance is stashed here.
-var app_io: std.Io = undefined;
+const App = struct {
+    greeting: []const u8,
+
+    pub fn find(self: *App, id: []const u8) ?User {
+        _ = self;
+        if (std.mem.eql(u8, id, "missing")) return null;
+        return .{ .id = id, .name = "Ada" };
+    }
+};
+const User = struct { id: []const u8, name: []const u8 };
+const Ctx = struct { site: []const u8 = "zerb demo" };
+
+const Server = zerb.Server(.{ .App = *App, .Context = Ctx });
+
+/// Plain httpz-protocol middleware: stamps every response.
+const RequestId = struct {
+    pub const Config = struct { header: []const u8 = "X-Request-Id" };
+    cfg: Config,
+
+    pub fn init(cfg: Config) !RequestId {
+        return .{ .cfg = cfg };
+    }
+
+    pub fn execute(self: *const RequestId, req: *httpz.Request, res: *httpz.Response, executor: anytype) !void {
+        _ = req;
+        res.header(self.cfg.header, "static-for-brevity");
+        return executor.next();
+    }
+};
 
 pub fn main(init: std.process.Init) !void {
-    app_io = init.io;
-    var s = try zerb.Server.create(init.io, init.gpa, 8080);
-    defer s.deinit();
+    var app = App{ .greeting = "hello" };
 
-    try s.api(.GET, "/api/hello", helloHandler);
-    try s.page("/hello", &.{"hello"}, helloDataFunc);
+    const server = try Server.init(init.io, init.gpa, &app, .{
+        // Full httpz.Config, untouched by zerb.
+        .httpz = .{
+            .address = .all(8080),
+            .request = .{ .max_form_count = 20 },
+        },
+        .zmpl = .{
+            .context = siteContext,
+            .error_templates = &.{ "errors/show", "layouts/app" },
+        },
+        .errors = .{ .map = mapError },
+    });
+    defer server.deinit();
 
-    try s.httpzServer.listen();
+    // Middleware: global, before any route.
+    const rid = try server.middleware(RequestId, .{});
+    try server.use(&.{rid});
+
+    // .api(): plain JSON. error.NotFound -> 404 {"error":{...}}.
+    try server.api(.GET, "/api/users/:id", getUser, .{});
+
+    // .htmx(): fragment "users/row" (no layout), swapped over the caller's
+    // row, then a client event fires.
+    _ = (try server.htmx(.POST, "/users/:id/rename", .{}))
+        .templates(&.{"users/row"})
+        .data("user", loadUser)
+        .retarget("closest tr")
+        .reswap("outerHTML")
+        .trigger("user:renamed");
+
+    // .page(): "users/show" inside "layouts/app", same .data() contract.
+    _ = (try server.page("/users/:id", &.{ "users/show", "layouts/app" }, .{}))
+        .data("user", loadUser)
+        .data("greeting", greeting);
+
+    _ = (try server.page("/hello", &.{ "hello", "layouts/app" }, .{}))
+        .data("message", greeting);
+
+    std.log.info("zerb demo listening on http://localhost:8080", .{});
+    try server.listen();
 }
 
-fn helloHandler(req: *httpz.Request, res: *httpz.Response) zerb.ServerError!void {
+fn getUser(app: *App, req: *httpz.Request, res: *httpz.Response) !void {
+    const id = req.param("id") orelse return error.BadRequest;
+    const user = app.find(id) orelse return error.NotFound;
+    try res.json(user, .{});
+}
+
+fn loadUser(app: *App, req: *httpz.Request) ?User {
+    const id = req.param("id") orelse return null;
+    return app.find(id);
+}
+
+fn greeting(app: *App, req: *httpz.Request) ?[]const u8 {
     _ = req;
-    res.body = "Hello, world!";
+    return app.greeting;
 }
 
-fn helloDataFunc(req: *httpz.Request) ?zmpl.Data {
-    var data = zmpl.Data.init(app_io, req.arena);
-    const root = data.object() catch return null;
-    _ = root.put("message", data.string("Hello, World!")) catch return null;
+fn siteContext(app: *App, req: *httpz.Request) Ctx {
+    _ = app;
+    _ = req;
+    return .{};
+}
 
-    return data;
+fn mapError(app: *App, err: anyerror, req: *httpz.Request) zerb.ErrorResponse {
+    _ = app;
+    return switch (err) {
+        error.UserSuspended => .{ .status = 423, .code = "user_suspended", .message = "User is suspended" },
+        else => zerb.defaultErrorMapper(err, req),
+    };
 }
