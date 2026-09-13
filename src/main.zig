@@ -1,4 +1,4 @@
-//! Demo application for zerb: one `.api` route, one `.htmx` route, two
+//! Demo application for zerb: one `.api` route, two `.htmx` routes, two
 //! `.page` routes, a global middleware and a custom error mapper.
 //!
 //! Run with `zig build run`, then try:
@@ -6,7 +6,11 @@
 //!   curl -i localhost:8080/api/users/1
 //!   curl -i localhost:8080/api/users/missing
 //!   curl -i localhost:8080/users/1
-//!   curl -i -X POST localhost:8080/users/1/rename
+//!   curl -i localhost:8080/users/missing              # 404 via transformer error
+//!   curl -i -X POST localhost:8080/users/1/rename     # dynamic HX-Trigger
+//!   curl -i -X POST localhost:8080/users/same/rename  # HX-Reswap: none
+//!   curl -i -X POST localhost:8080/users/missing/rename  # 404, HX-Retarget only
+//!   curl -i -X DELETE localhost:8080/users/1
 //!   curl -i localhost:8080/hello
 //!   curl -i localhost:8080/nope
 const std = @import("std");
@@ -68,15 +72,25 @@ pub fn main(init: std.process.Init) !void {
     try server.api(.GET, "/api/users/:id", getUser, .{});
 
     // .htmx(): fragment "users/row" (no layout), swapped over the caller's
-    // row, then a client event fires.
+    // row. The builder records defaults; `renameUser` overrides HX-Trigger
+    // with a per-request value, sends `HX-Reswap: none` when nothing
+    // changed, and on an unknown id retargets the error body to `#errors`
+    // and returns error.NotFound (404, route defaults not sent).
     _ = (try server.htmx(.POST, "/users/:id/rename", .{}))
         .templates(&.{"users/row"})
-        .data("user", loadUser)
+        .data("user", renameUser)
         .retarget("closest tr")
         .reswap("outerHTML")
         .trigger("user:renamed");
 
-    // .page(): "users/show" inside "layouts/app", same .data() contract.
+    // .htmx() with no template: headers only. The transformer decides
+    // where the client goes next.
+    _ = (try server.htmx(.DELETE, "/users/:id", .{}))
+        .data("user", deleteUser)
+        .trigger("user:deleted");
+
+    // .page(): "users/show" inside "layouts/app". `loadUser` is the same
+    // `!?T` transformer shape without `hx`; error.NotFound -> 404 page.
     _ = (try server.page("/users/:id", &.{ "users/show", "layouts/app" }, .{}))
         .data("user", loadUser)
         .data("greeting", greeting);
@@ -94,9 +108,38 @@ fn getUser(app: *App, req: *httpz.Request, res: *httpz.Response) !void {
     try res.json(user, .{});
 }
 
-fn loadUser(app: *App, req: *httpz.Request) ?User {
-    const id = req.param("id") orelse return null;
-    return app.find(id);
+/// `!?T`: a missing user is a 404, not a template error.
+fn loadUser(app: *App, req: *httpz.Request) !?User {
+    const id = req.param("id") orelse return error.BadRequest;
+    return app.find(id) orelse error.NotFound;
+}
+
+/// `!?T` plus the per-request htmx headers. Strings written into `hx`
+/// are not copied, so dynamic values live in `req.arena`.
+fn renameUser(app: *App, req: *httpz.Request, hx: *zerb.htmx.Headers) !?User {
+    const id = req.param("id") orelse return error.BadRequest;
+    const user = app.find(id) orelse {
+        // The error page replaces the contents of #errors instead of the row.
+        hx.retarget = "#errors";
+        hx.reswap = "innerHTML";
+        return error.NotFound;
+    };
+    if (std.mem.eql(u8, id, "same")) {
+        // Nothing changed: keep the row, skip the event.
+        hx.reswap = "none";
+        return user;
+    }
+    hx.trigger = try std.fmt.allocPrint(req.arena, "{{\"user:renamed\":{{\"id\":\"{s}\"}}}}", .{id});
+    return user;
+}
+
+/// Header-only route: the value returned is never rendered (no template),
+/// so `?void` says so; the headers are the whole response.
+fn deleteUser(app: *App, req: *httpz.Request, hx: *zerb.htmx.Headers) !?void {
+    const id = req.param("id") orelse return error.BadRequest;
+    _ = app.find(id) orelse return error.NotFound;
+    hx.push_url = "/users";
+    return {};
 }
 
 fn greeting(app: *App, req: *httpz.Request) ?[]const u8 {

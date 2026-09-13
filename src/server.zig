@@ -39,8 +39,25 @@ pub fn Server(comptime spec: Spec) type {
         /// The httpz action shape, chosen exactly the way httpz chooses it.
         pub const Action = httpz.Action(App);
 
-        /// `.data()` transformer shape. `T` is anything zmpl's `Value.put`
-        /// coerces (see section 3.2 of the design). `null` means "omit key".
+        /// The plain `.data()` transformer shape. `T` is anything zmpl's
+        /// `Value.put` coerces (see section 3.2 of the design). `null` means
+        /// "omit key".
+        ///
+        /// `.data()` itself accepts four shapes, chosen at comptime from the
+        /// function's parameters and return type (`app` only when
+        /// `App != void`):
+        ///
+        ///   fn (app, req) ?T                       // this type
+        ///   fn (app, req) !?T                      // may fail
+        ///   fn (app, req, hx: *htmx.Headers) ?T    // .htmx routes only
+        ///   fn (app, req, hx: *htmx.Headers) !?T   // .htmx routes only
+        ///
+        /// `T == void` puts nothing: for a transformer that only sets headers
+        /// or performs a write. A returned error aborts the render and goes
+        /// through the error mapper like an action error. `hx` is this
+        /// request's htmx response headers; see `Handler.dispatch` for how
+        /// they merge with the route's recorded ones. A `.page` route rejects
+        /// the `hx` shapes at compile time.
         pub fn Transformer(comptime T: type) type {
             return if (App == void)
                 *const fn (*httpz.Request) ?T
@@ -112,15 +129,33 @@ pub fn Server(comptime spec: Spec) type {
             /// httpz calls this instead of the action. Runs `action`, catches
             /// any error, and turns it into a response according to the
             /// route kind.
+            ///
+            /// For `.htmx`/`.page` routes it also owns the per-request htmx
+            /// headers: `req_hx` starts empty, transformers that take an `hx`
+            /// parameter write into it, and
+            ///
+            /// - on success `render` applies `route.hx.overlay(req_hx)`, so a
+            ///   transformer write wins over the route's recorded value and
+            ///   untouched fields keep the route default;
+            /// - on failure only `req_hx` is applied, after the error body.
+            ///   Route defaults (`.reswap("outerHTML")`, `.trigger(...)`)
+            ///   describe the success fragment and are not sent with an error
+            ///   page; what a transformer wrote before returning the error
+            ///   (`hx.retarget = "#errors"`) is.
             pub fn dispatch(h: *Handler, action: Action, req: *httpz.Request, res: *httpz.Response) !void {
                 const server = h.server;
+                if (isRenderAction(action)) {
+                    var req_hx = hx.Headers{};
+                    render(h.app, req, res, &req_hx) catch |err| {
+                        const er = server.mapError(h.app, err, req);
+                        try server.respondErrorPage(h.app, req, res, er);
+                        req_hx.apply(res);
+                    };
+                    return;
+                }
                 callAction(action, h.app, req, res) catch |err| {
                     const er = server.mapError(h.app, err, req);
-                    if (isRenderAction(action)) {
-                        try server.respondErrorPage(h.app, req, res, er);
-                    } else {
-                        try respondErrorJson(res, er);
-                    }
+                    try respondErrorJson(res, er);
                 };
             }
 
@@ -284,16 +319,19 @@ pub fn Server(comptime spec: Spec) type {
                 return self;
             }
 
-            /// `transformer` must be `Transformer(T)` for some `T`; `T` is
-            /// inferred from its return type at comptime.
+            /// `transformer` is any of the shapes listed on `Transformer`;
+            /// `T` is inferred from its return type at comptime. Entries run
+            /// in registration order; for both data keys and `hx` header
+            /// fields the later write wins.
             pub fn data(self: *HtmxRoute, key: []const u8, transformer: anytype) *HtmxRoute {
                 self.spec.addData(key, transformer);
                 return self;
             }
 
-            // One method per htmx v4 response header. Each records a value
-            // that is applied per request through `htmx.Headers.apply`.
-            // Values are copied into the server arena.
+            // One method per htmx v4 response header. Each records a default
+            // value for the route that is applied per request through
+            // `htmx.Headers.apply`, unless a transformer sets the same field
+            // for that request. Values are copied into the server arena.
 
             /// HX-Trigger
             pub fn trigger(self: *HtmxRoute, events: []const u8) *HtmxRoute {
@@ -353,8 +391,13 @@ pub fn Server(comptime spec: Spec) type {
         pub const PageRoute = struct {
             spec: *RouteSpec,
 
-            /// Identical contract to `HtmxRoute.data`.
+            /// Identical contract to `HtmxRoute.data`, except that the `hx`
+            /// parameter is rejected: a full page has no htmx response
+            /// headers, so a transformer that wants them is a mistake here.
             pub fn data(self: *PageRoute, key: []const u8, transformer: anytype) *PageRoute {
+                if (comptime transformerShape(@TypeOf(transformer)).takes_hx) {
+                    @compileError("zerb: .page() transformer " ++ @typeName(@TypeOf(transformer)) ++ " takes a *htmx.Headers parameter, but htmx headers are meaningless on a full page; drop the parameter or register the route with .htmx()");
+                }
                 self.spec.addData(key, transformer);
                 return self;
             }
@@ -384,17 +427,26 @@ pub fn Server(comptime spec: Spec) type {
             }
 
             fn addData(self: *RouteSpec, key: []const u8, transformer: anytype) void {
-                const T = TransformerValue(@TypeOf(transformer));
-                const Ptr = Transformer(T);
-                // Coerces a function body to its pointer and, in the same
-                // step, type-checks the parameter list against `Transformer(T)`.
+                const F = @TypeOf(transformer);
+                const shape = comptime transformerShape(F);
+                // A function body coerces to a pointer to itself; a pointer is
+                // already the right type. `transformerShape` has validated the
+                // parameter list, so the call below is well-typed.
+                const Ptr = if (@typeInfo(F) == .pointer) F else *const F;
                 const ptr: Ptr = transformer;
 
                 const gen = struct {
-                    fn apply(erased: *const anyopaque, app: App, req: *httpz.Request, k: []const u8, root: *zmpl.Data.Value) anyerror!void {
+                    fn apply(erased: *const anyopaque, app: App, req: *httpz.Request, req_hx: *hx.Headers, k: []const u8, root: *zmpl.Data.Value) anyerror!void {
                         const f: Ptr = @ptrCast(@alignCast(erased));
-                        const maybe = if (comptime App == void) f(req) else f(app, req);
+                        const result = if (comptime App == void)
+                            (if (comptime shape.takes_hx) f(req, req_hx) else f(req))
+                        else
+                            (if (comptime shape.takes_hx) f(app, req, req_hx) else f(app, req));
+                        const maybe = if (comptime shape.fallible) try result else result;
                         const value = maybe orelse return;
+                        // `?void`: the transformer ran for its effects (headers,
+                        // writes) and has nothing to put. Header-only routes.
+                        if (comptime shape.T == void) return;
                         try root.put(k, value);
                     }
                 };
@@ -407,28 +459,65 @@ pub fn Server(comptime spec: Spec) type {
             }
         };
 
-        /// Type-erased `.data()` entry. `apply` is generated at comptime per `T`.
+        /// Type-erased `.data()` entry. `apply` is generated at comptime per
+        /// transformer shape.
         const DataEntry = struct {
             key: []const u8,
             transformer: *const anyopaque,
-            apply: *const fn (*const anyopaque, App, *httpz.Request, []const u8, *zmpl.Data.Value) anyerror!void,
+            apply: *const fn (*const anyopaque, App, *httpz.Request, *hx.Headers, []const u8, *zmpl.Data.Value) anyerror!void,
         };
 
-        /// Extracts `T` from a `fn (...) ?T` (or pointer to one).
-        fn TransformerValue(comptime F: type) type {
+        /// What `.data()` learned about one transformer at comptime.
+        const TransformerShape = struct {
+            /// The `T` in `?T` / `!?T`.
+            T: type,
+            /// Takes the trailing `*htmx.Headers` parameter.
+            takes_hx: bool,
+            /// Returns `!?T` rather than `?T`.
+            fallible: bool,
+        };
+
+        /// Classifies a transformer (function or pointer to one) into one of
+        /// the four accepted shapes, or fails compilation with the reason.
+        fn transformerShape(comptime F: type) TransformerShape {
+            const expected = "`fn (" ++ (if (App == void) "" else "app, ") ++ "*httpz.Request[, *htmx.Headers]) ?T` or `!?T`";
             const fn_info = switch (@typeInfo(F)) {
                 .@"fn" => |f| f,
                 .pointer => |p| switch (@typeInfo(p.child)) {
                     .@"fn" => |f| f,
-                    else => @compileError("zerb: .data() transformer must be a function, got " ++ @typeName(F)),
+                    else => @compileError("zerb: .data() transformer must be " ++ expected ++ ", got " ++ @typeName(F)),
                 },
-                else => @compileError("zerb: .data() transformer must be a function, got " ++ @typeName(F)),
+                else => @compileError("zerb: .data() transformer must be " ++ expected ++ ", got " ++ @typeName(F)),
             };
-            const R = fn_info.return_type orelse @compileError("zerb: .data() transformer must return `?T`");
-            return switch (@typeInfo(R)) {
+
+            const params = fn_info.params;
+            const n_app: usize = if (App == void) 0 else 1;
+            const takes_hx = if (params.len == n_app + 1)
+                false
+            else if (params.len == n_app + 2)
+                true
+            else
+                @compileError("zerb: .data() transformer must be " ++ expected ++ ", got " ++ @typeName(F));
+            if (App != void and params[0].type != @as(?type, App)) {
+                @compileError("zerb: .data() transformer's first parameter must be the app (" ++ @typeName(App) ++ "), got " ++ @typeName(F));
+            }
+            if (params[n_app].type != @as(?type, *httpz.Request)) {
+                @compileError("zerb: .data() transformer's request parameter must be `*httpz.Request`, got " ++ @typeName(F));
+            }
+            if (takes_hx and params[n_app + 1].type != @as(?type, *hx.Headers)) {
+                @compileError("zerb: .data() transformer's last parameter must be `*htmx.Headers`, got " ++ @typeName(F));
+            }
+
+            const R = fn_info.return_type orelse @compileError("zerb: .data() transformer must return `?T` or `!?T`");
+            const fallible, const Payload = switch (@typeInfo(R)) {
+                .error_union => |eu| .{ true, eu.payload },
+                else => .{ false, R },
+            };
+            const T = switch (@typeInfo(Payload)) {
                 .optional => |o| o.child,
-                else => @compileError("zerb: .data() transformer must return `?T`, got " ++ @typeName(R)),
+                else => @compileError("zerb: .data() transformer must return `?T` or `!?T`, got " ++ @typeName(R)),
             };
+            return .{ .T = T, .takes_hx = takes_hx, .fallible = fallible };
         }
 
         fn newRouteSpec(self: *Self, kind: RouteKind) !*RouteSpec {
@@ -497,38 +586,49 @@ pub fn Server(comptime spec: Spec) type {
         }
 
         /// The internal action registered for `.htmx` and `.page` routes.
+        /// `Handler.dispatch` recognises it by address and calls `render`
+        /// directly so it can keep the per-request headers across a failure;
+        /// the action bodies below only matter if something other than
+        /// `dispatch` invokes the pointer.
         const renderAction: Action = if (App == void) renderVoid else renderApp;
 
         fn renderVoid(req: *httpz.Request, res: *httpz.Response) anyerror!void {
-            return render({}, req, res);
+            var req_hx = hx.Headers{};
+            return render({}, req, res, &req_hx);
         }
 
         fn renderApp(app: App, req: *httpz.Request, res: *httpz.Response) anyerror!void {
-            return render(app, req, res);
+            var req_hx = hx.Headers{};
+            return render(app, req, res, &req_hx);
         }
 
         fn isRenderAction(action: Action) bool {
             return @intFromPtr(action) == @intFromPtr(renderAction);
         }
 
-        fn render(app: App, req: *httpz.Request, res: *httpz.Response) anyerror!void {
+        /// Success path of a template route: data, then the chain, then (for
+        /// `.htmx`) the route defaults overlaid with this request's `req_hx`.
+        /// On error nothing is applied here; `dispatch` decides.
+        fn render(app: App, req: *httpz.Request, res: *httpz.Response, req_hx: *hx.Headers) anyerror!void {
             const route_spec: *const RouteSpec = @ptrCast(@alignCast(req.route_data.?));
             const server = route_spec.server;
 
-            var d = try server.buildData(route_spec, app, req);
+            var d = try server.buildData(route_spec, app, req, req_hx);
             res.body = try server.renderChain(route_spec.chain, &d, app, req);
             res.content_type = .HTML;
 
             if (route_spec.kind == .htmx) {
-                route_spec.hx.apply(res);
+                route_spec.hx.overlay(req_hx.*).apply(res);
             }
         }
 
-        fn buildData(self: *Self, route_spec: *const RouteSpec, app: App, req: *httpz.Request) !zmpl.Data {
+        /// Runs every `.data()` entry in registration order. A transformer
+        /// error propagates immediately; entries after it do not run.
+        fn buildData(self: *Self, route_spec: *const RouteSpec, app: App, req: *httpz.Request, req_hx: *hx.Headers) !zmpl.Data {
             var d = zmpl.Data.init(self.io, req.arena);
             const root = try d.object();
             for (route_spec.data.items) |entry| {
-                try entry.apply(entry.transformer, app, req, entry.key, root);
+                try entry.apply(entry.transformer, app, req, req_hx, entry.key, root);
             }
             return d;
         }
@@ -671,6 +771,65 @@ fn plainFail(_: *httpz.Request, _: *httpz.Response) !void {
 
 fn plainMessage(_: *httpz.Request) ?[]const u8 {
     return "Hello from void";
+}
+
+// --- transformer shapes under test ------------------------------------------
+
+/// `!?T`, App: 400 without an id, 404 for "missing", else the user.
+fn loadUserOrFail(_: *TestApp, req: *httpz.Request) !?TestUser {
+    const id = req.param("id") orelse return error.BadRequest;
+    if (std.mem.eql(u8, id, "missing")) return error.NotFound;
+    return .{ .id = id, .name = "Ada" };
+}
+
+/// `!?T`, App, returns null: the key is omitted, no error.
+fn fallibleNothing(_: *TestApp, _: *httpz.Request) !?[]const u8 {
+    return null;
+}
+
+/// `(app, req, hx) ?T`: a dynamic HX-Trigger built in the request arena.
+fn triggerWithId(_: *TestApp, req: *httpz.Request, h: *hx.Headers) ?TestUser {
+    const id = req.param("id") orelse return null;
+    h.trigger = std.fmt.allocPrint(req.arena, "user:renamed:{s}", .{id}) catch return null;
+    return .{ .id = id, .name = "Ada" };
+}
+
+/// `(app, req, hx) ?T`: a second writer for the same header field.
+fn triggerSecond(_: *TestApp, _: *httpz.Request, h: *hx.Headers) ?[]const u8 {
+    h.trigger = "second";
+    return "x";
+}
+
+/// `(app, req, hx) !?T`: sets a header, then fails.
+fn retargetThenFail(_: *TestApp, _: *httpz.Request, h: *hx.Headers) !?TestUser {
+    h.retarget = "#errors";
+    h.reswap = "innerHTML";
+    return error.UnprocessableEntity;
+}
+
+/// `(app, req, hx) !?T`: happy path of the fallible+hx shape.
+fn fallibleWithHx(_: *TestApp, _: *httpz.Request, h: *hx.Headers) !?[]const u8 {
+    h.push_url = "/users/1";
+    return "fallible-hx";
+}
+
+/// void App, `!?T`.
+fn plainFallible(req: *httpz.Request) !?[]const u8 {
+    if (req.param("fail") != null) return error.Forbidden;
+    return "Hello fallible";
+}
+
+/// void App, `(req, hx) ?T`.
+fn plainWithHx(_: *httpz.Request, h: *hx.Headers) ?[]const u8 {
+    h.trigger = "void:evt";
+    return "Hello hx";
+}
+
+/// void App, `(req, hx) !?T`.
+fn plainFallibleWithHx(req: *httpz.Request, h: *hx.Headers) !?[]const u8 {
+    h.retarget = "#void-errors";
+    if (req.param("fail") != null) return error.Conflict;
+    return "Hello fallible hx";
 }
 
 const CountingMiddleware = struct {
@@ -855,7 +1014,8 @@ test "data: null omits the key and later duplicates win" {
 
     var ht = httpz.testing.init(.{});
     defer ht.deinit();
-    var d = try server.buildData(route.spec, &app, ht.req);
+    var req_hx = hx.Headers{};
+    var d = try server.buildData(route.spec, &app, ht.req, &req_hx);
     try t.expectEqualStrings("override", d.getT(.string, "greeting").?);
     try t.expect(d.get("missing") == null);
 }
@@ -889,7 +1049,8 @@ test "data: transformers accept structs, slices, ints, bools and pointers" {
 
     var ht = httpz.testing.init(.{});
     defer ht.deinit();
-    var d = try server.buildData(route.spec, &app, ht.req);
+    var req_hx = hx.Headers{};
+    var d = try server.buildData(route.spec, &app, ht.req, &req_hx);
     try t.expectEqualStrings("Bo", d.get("user").?.get("name").?.string.value);
     try t.expectEqual(3, d.getT(.integer, "count").?);
     try t.expectEqual(true, d.getT(.boolean, "flag").?);
@@ -1200,6 +1361,329 @@ test "void App: actions and transformers take no app argument" {
     ht.req.route_data = route.spec;
     try server.handler.dispatch(PlainServer.renderAction, ht.req, ht.res);
     try ht.expectBody("Hello from void\n");
+}
+
+test "transformers: ?T and !?T shapes, with and without hx, App" {
+    var app = TestApp{};
+    const server = try testServer(&app, .{});
+    defer server.deinit();
+
+    const route = (try server.htmx(.POST, "/shapes/:id", .{}))
+        .data("plain", greeting) // (app, req) ?T
+        .data("user", loadUserOrFail) // (app, req) !?T
+        .data("omitted", fallibleNothing) // (app, req) !?T -> null
+        .data("hx_user", triggerWithId) // (app, req, hx) ?T
+        .data("hx_fallible", fallibleWithHx); // (app, req, hx) !?T
+
+    var ht = httpz.testing.init(.{});
+    defer ht.deinit();
+    ht.param("id", "5");
+    var req_hx = hx.Headers{};
+    var d = try server.buildData(route.spec, &app, ht.req, &req_hx);
+    try t.expectEqualStrings("hello", d.getT(.string, "plain").?);
+    try t.expectEqualStrings("5", d.get("user").?.get("id").?.string.value);
+    try t.expect(d.get("omitted") == null);
+    try t.expectEqualStrings("5", d.get("hx_user").?.get("id").?.string.value);
+    try t.expectEqualStrings("fallible-hx", d.getT(.string, "hx_fallible").?);
+    try t.expectEqualStrings("user:renamed:5", req_hx.trigger.?);
+    try t.expectEqualStrings("/users/1", req_hx.push_url.?);
+}
+
+test "transformers: ?T and !?T shapes, with and without hx, void App" {
+    const server = try PlainServer.init(t.io, t.allocator, {}, .{});
+    defer server.deinit();
+
+    const route = (try server.htmx(.GET, "/hello", .{}))
+        .templates(&.{"hello"})
+        .data("message", plainMessage) // (req) ?T
+        .data("message", plainFallible) // (req) !?T
+        .data("ignored", plainWithHx) // (req, hx) ?T
+        .data("message", plainFallibleWithHx); // (req, hx) !?T
+
+    var ht = httpz.testing.init(.{});
+    defer ht.deinit();
+    ht.req.route_data = route.spec;
+    try server.handler.dispatch(PlainServer.renderAction, ht.req, ht.res);
+    try ht.expectStatus(200);
+    try ht.expectBody("Hello fallible hx\n");
+    try ht.expectHeader("HX-Trigger", "void:evt");
+    try ht.expectHeader("HX-Retarget", "#void-errors");
+}
+
+test "transformers: void App error is mapped and keeps only transformer headers" {
+    const server = try PlainServer.init(t.io, t.allocator, {}, .{});
+    defer server.deinit();
+
+    const route = (try server.htmx(.GET, "/hello", .{}))
+        .templates(&.{"hello"})
+        .reswap("outerHTML")
+        .data("message", plainFallibleWithHx);
+
+    var ht = httpz.testing.init(.{});
+    defer ht.deinit();
+    ht.param("fail", "1");
+    ht.req.route_data = route.spec;
+    try server.handler.dispatch(PlainServer.renderAction, ht.req, ht.res);
+    try ht.expectStatus(409);
+    try ht.expectBody("Conflict");
+    try ht.expectHeader("HX-Retarget", "#void-errors");
+    try ht.expectHeader("HX-Reswap", null);
+}
+
+test "htmx: transformer header overrides the route default; last writer wins" {
+    var app = TestApp{};
+    const server = try testServer(&app, .{});
+    defer server.deinit();
+
+    const route = (try server.htmx(.POST, "/users/:id/rename", .{}))
+        .templates(&.{"users/row"})
+        .trigger("route-default")
+        .retarget("closest tr")
+        .data("user", triggerWithId)
+        .data("second", triggerSecond);
+
+    var ht = httpz.testing.init(.{});
+    defer ht.deinit();
+    ht.param("id", "9");
+    try dispatchRoute(server, &ht, TestServer.renderAction, route.spec);
+    try ht.expectStatus(200);
+    try ht.expectBody("<tr><td>9</td><td>Ada</td></tr>\n");
+    // Both transformers wrote HX-Trigger; registration order decides.
+    try ht.expectHeader("HX-Trigger", "second");
+    // Nobody touched HX-Retarget: the route default stands.
+    try ht.expectHeader("HX-Retarget", "closest tr");
+}
+
+test "htmx: a single transformer write beats the route default, other defaults stay" {
+    var app = TestApp{};
+    const server = try testServer(&app, .{});
+    defer server.deinit();
+
+    const route = (try server.htmx(.POST, "/users/:id/rename", .{}))
+        .templates(&.{"users/row"})
+        .trigger("route-default")
+        .reswap("outerHTML")
+        .pushUrl("false")
+        .data("user", triggerWithId);
+
+    var ht = httpz.testing.init(.{});
+    defer ht.deinit();
+    ht.param("id", "3");
+    try dispatchRoute(server, &ht, TestServer.renderAction, route.spec);
+    try ht.expectHeader("HX-Trigger", "user:renamed:3");
+    try ht.expectHeader("HX-Reswap", "outerHTML");
+    try ht.expectHeader("HX-Push-Url", "false");
+    // Applied exactly once: Content-Length, Content-Type, 3 hx headers.
+    try ht.expectHeaderCount(5);
+}
+
+test "htmx: route defaults are sent when no transformer takes hx" {
+    var app = TestApp{};
+    const server = try testServer(&app, .{});
+    defer server.deinit();
+
+    const route = (try server.htmx(.POST, "/users/:id/rename", .{}))
+        .templates(&.{"users/row"})
+        .trigger("route-default")
+        .data("user", loadUserOrFail);
+
+    var ht = httpz.testing.init(.{});
+    defer ht.deinit();
+    ht.param("id", "3");
+    try dispatchRoute(server, &ht, TestServer.renderAction, route.spec);
+    try ht.expectStatus(200);
+    try ht.expectHeader("HX-Trigger", "route-default");
+}
+
+test "errors: transformer error maps to status through error templates on .htmx" {
+    var app = TestApp{};
+    const server = try testServer(&app, .{
+        .zmpl = .{ .error_templates = &.{ "errors/show", "layouts/app" } },
+    });
+    defer server.deinit();
+
+    const route = (try server.htmx(.POST, "/users/:id/rename", .{}))
+        .templates(&.{"users/row"})
+        .data("user", loadUserOrFail);
+
+    {
+        var ht = httpz.testing.init(.{});
+        defer ht.deinit();
+        ht.param("id", "missing");
+        try dispatchRoute(server, &ht, TestServer.renderAction, route.spec);
+        try ht.expectStatus(404);
+        try ht.expectHeader("Content-Type", "text/html; charset=UTF-8");
+        try ht.expectBody("<main><h1>404 not_found</h1>\n<p>Not found</p></main>");
+    }
+    {
+        var ht = httpz.testing.init(.{});
+        defer ht.deinit();
+        // No id param at all.
+        try dispatchRoute(server, &ht, TestServer.renderAction, route.spec);
+        try ht.expectStatus(400);
+        try ht.expectBody("<main><h1>400 bad_request</h1>\n<p>Bad request</p></main>");
+    }
+}
+
+test "errors: transformer error maps to status through error templates on .page" {
+    var app = TestApp{};
+    const server = try testServer(&app, .{
+        .zmpl = .{ .error_templates = &.{"errors/show"} },
+    });
+    defer server.deinit();
+
+    const route = try server.page("/users/:id", &.{ "users/show", "layouts/app" }, .{});
+    _ = route.data("user", loadUserOrFail).data("greeting", greeting);
+
+    {
+        var ht = httpz.testing.init(.{});
+        defer ht.deinit();
+        ht.param("id", "missing");
+        try dispatchRoute(server, &ht, TestServer.renderAction, route.spec);
+        try ht.expectStatus(404);
+        try ht.expectBody("<h1>404 not_found</h1>\n<p>Not found</p>\n");
+        try ht.expectHeader("HX-Trigger", null);
+    }
+    {
+        var ht = httpz.testing.init(.{});
+        defer ht.deinit();
+        try dispatchRoute(server, &ht, TestServer.renderAction, route.spec);
+        try ht.expectStatus(400);
+        try ht.expectBody("<h1>400 bad_request</h1>\n<p>Bad request</p>\n");
+    }
+}
+
+test "errors: transformer error without error templates is text/plain" {
+    var app = TestApp{ .suspended = true };
+    const server = try testServer(&app, .{ .errors = .{ .map = mapTestError } });
+    defer server.deinit();
+
+    const S = struct {
+        fn suspended(a: *TestApp, _: *httpz.Request) !?TestUser {
+            if (a.suspended) return error.UserSuspended;
+            return null;
+        }
+    };
+    const route = (try server.htmx(.GET, "/s", .{})).templates(&.{"users/row"}).data("user", S.suspended);
+
+    var ht = httpz.testing.init(.{});
+    defer ht.deinit();
+    try dispatchRoute(server, &ht, TestServer.renderAction, route.spec);
+    try ht.expectStatus(423);
+    try ht.expectHeader("Content-Type", "text/plain; charset=UTF-8");
+    try ht.expectBody("User is suspended");
+}
+
+test "errors: on failure only transformer-set headers are sent, never route defaults" {
+    var app = TestApp{};
+    const server = try testServer(&app, .{
+        .zmpl = .{ .error_templates = &.{"errors/show"} },
+    });
+    defer server.deinit();
+
+    const route = (try server.htmx(.POST, "/users/:id/rename", .{}))
+        .templates(&.{"users/row"})
+        .reswap("outerHTML")
+        .trigger("user:renamed")
+        .pushUrl("false")
+        .data("user", retargetThenFail)
+        // Never runs: the entry before it failed.
+        .data("second", triggerSecond);
+
+    var ht = httpz.testing.init(.{});
+    defer ht.deinit();
+    ht.param("id", "1");
+    try dispatchRoute(server, &ht, TestServer.renderAction, route.spec);
+    try ht.expectStatus(422);
+    try ht.expectBody("<h1>422 unprocessable</h1>\n<p>Unprocessable entity</p>\n");
+    // Written by the failing transformer: sent, so the error body lands in
+    // the slot it asked for. `reswap` is sent because the transformer set it,
+    // not because the route did.
+    try ht.expectHeader("HX-Retarget", "#errors");
+    try ht.expectHeader("HX-Reswap", "innerHTML");
+    // Route defaults: not sent with an error page.
+    try ht.expectHeader("HX-Trigger", null);
+    try ht.expectHeader("HX-Push-Url", null);
+}
+
+test "errors: a render failure after the transformers keeps the same header rule" {
+    var app = TestApp{};
+    const server = try testServer(&app, .{});
+    defer server.deinit();
+
+    // `users/show` needs `user`, which nobody provides: zmpl fails after
+    // `triggerSecond` has already written HX-Trigger.
+    const route = (try server.htmx(.GET, "/frag", .{}))
+        .templates(&.{"users/show"})
+        .reswap("outerHTML")
+        .data("greeting", triggerSecond);
+
+    var ht = httpz.testing.init(.{});
+    defer ht.deinit();
+    try dispatchRoute(server, &ht, TestServer.renderAction, route.spec);
+    try ht.expectStatus(500);
+    try ht.expectHeader("HX-Trigger", "second");
+    try ht.expectHeader("HX-Reswap", null);
+}
+
+test "transformers: ?void puts nothing and serves header-only routes" {
+    var app = TestApp{};
+    const server = try testServer(&app, .{});
+    defer server.deinit();
+
+    const S = struct {
+        fn gone(_: *TestApp, req: *httpz.Request, h: *hx.Headers) !?void {
+            _ = req.param("id") orelse return error.NotFound;
+            h.push_url = "/users";
+            return {};
+        }
+    };
+    const route = (try server.htmx(.DELETE, "/users/:id", .{}))
+        .trigger("user:deleted")
+        .data("effect", S.gone);
+
+    var ht = httpz.testing.init(.{});
+    defer ht.deinit();
+    ht.param("id", "1");
+    var req_hx = hx.Headers{};
+    var d = try server.buildData(route.spec, &app, ht.req, &req_hx);
+    try t.expect(d.get("effect") == null);
+
+    try dispatchRoute(server, &ht, TestServer.renderAction, route.spec);
+    try ht.expectStatus(200);
+    try ht.expectBody("");
+    try ht.expectHeader("HX-Trigger", "user:deleted");
+    try ht.expectHeader("HX-Push-Url", "/users");
+}
+
+test "transformers: one hx-less transformer serves both .page and .htmx" {
+    var app = TestApp{};
+    const server = try testServer(&app, .{});
+    defer server.deinit();
+
+    const page_route = try server.page("/users/:id", &.{"users/row"}, .{});
+    _ = page_route.data("user", loadUserOrFail);
+    const htmx_route = (try server.htmx(.POST, "/users/:id/rename", .{}))
+        .templates(&.{"users/row"})
+        .trigger("user:renamed")
+        .data("user", loadUserOrFail);
+
+    {
+        var ht = httpz.testing.init(.{});
+        defer ht.deinit();
+        ht.param("id", "8");
+        try dispatchRoute(server, &ht, TestServer.renderAction, page_route.spec);
+        try ht.expectBody("<tr><td>8</td><td>Ada</td></tr>\n");
+        try ht.expectHeader("HX-Trigger", null);
+    }
+    {
+        var ht = httpz.testing.init(.{});
+        defer ht.deinit();
+        ht.param("id", "8");
+        try dispatchRoute(server, &ht, TestServer.renderAction, htmx_route.spec);
+        try ht.expectBody("<tr><td>8</td><td>Ada</td></tr>\n");
+        try ht.expectHeader("HX-Trigger", "user:renamed");
+    }
 }
 
 test "router: escape hatch exposes the httpz router" {

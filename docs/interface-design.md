@@ -143,9 +143,10 @@ pub fn defaultErrorMapper(err: anyerror, req: *httpz.Request) ErrorResponse {
 
 The request side is a set of typed readers over the v4 request headers. The
 response side is one struct, `htmx.Headers`, that is the *only* place hx
-response headers are written. The `.htmx()` route builder records into it and
-applies it per request; an `.api()` action can also build one directly for
-dynamic values.
+response headers are written. Three writers use it: the `.htmx()` route
+builder records a per-route default into one; a transformer that takes an
+`hx: *htmx.Headers` parameter writes per-request values into another (section
+3.3); an `.api()` action can build one directly and `apply` it itself.
 
 ```zig
 pub const htmx = struct {
@@ -187,11 +188,21 @@ pub const htmx = struct {
         replace_url: ?[]const u8 = null, // HX-Replace-Url
 
         /// Emits one `res.header(...)` per set field. Slices are not copied:
-        /// they must be static, server-arena, or `res.arena` owned.
+        /// they must be static, server-arena, or `req.arena`/`res.arena` owned.
         pub fn apply(self: Headers, res: *httpz.Response) void;
+
+        /// `base` with every field that is set in `over` replaced by `over`'s
+        /// value; fields `over` leaves `null`/`false` keep `base`'s. The
+        /// per-request merge rule (section 3.3).
+        pub fn overlay(base: Headers, over: Headers) Headers;
     };
 };
 ```
+
+There are deliberately no setter methods (`hx.trigger("x")`): Zig does not
+allow a method and a field to share a name, so setters would have forced
+either renamed fields or a second vocabulary. `hx.trigger = "x"` is the one
+spelling.
 
 ### 1.2 Server(spec)
 
@@ -209,8 +220,11 @@ pub fn Server(comptime spec: Spec) type {
         else
             *const fn (App, *httpz.Request, *httpz.Response) anyerror!void;
 
-        /// `.data()` transformer shape. `T` is anything zmpl's
+        /// The plain `.data()` transformer shape. `T` is anything zmpl's
         /// `Value.put` coerces (see section 3.2). `null` means "omit key".
+        /// `.data()` accepts this and three more shapes (section 3.2):
+        /// `!?T` return, and a trailing `hx: *htmx.Headers` parameter on
+        /// `.htmx` routes.
         pub fn Transformer(comptime T: type) type {
             return if (App == void)
                 *const fn (*httpz.Request) ?T
@@ -352,10 +366,11 @@ const RouteSpec = struct {
     hx: htmx.Headers = .{},
 };
 
-/// Type-erased `.data()` entry. `apply` is generated at comptime per `T`.
+/// Type-erased `.data()` entry. `apply` is generated at comptime per
+/// transformer shape (section 3.2).
 const DataEntry = struct {
     key: []const u8,
-    apply: *const fn (app: App, req: *httpz.Request, root: *zmpl.Data.Value) anyerror!void,
+    apply: *const fn (app: App, req: *httpz.Request, hx: *htmx.Headers, root: *zmpl.Data.Value) anyerror!void,
 };
 ```
 
@@ -420,13 +435,14 @@ pub const HtmxRoute = struct {
     pub fn templates(self: *HtmxRoute, names: []const []const u8) *HtmxRoute;
     pub fn tryTemplates(self: *HtmxRoute, names: []const []const u8) !*HtmxRoute;
 
-    /// Section 3.2. `transformer` must be `Transformer(T)` for some `T`;
-    /// `T` is inferred from its return type at comptime.
+    /// Section 3.2. `transformer` is any of the four accepted shapes; `T`
+    /// is inferred from its return type at comptime.
     pub fn data(self: *HtmxRoute, key: []const u8, transformer: anytype) *HtmxRoute;
 
-    // One method per htmx v4 response header. Each records a value that is
-    // applied per request through `htmx.Headers.apply`, i.e. one
-    // `res.header(name, value)`. Values are copied into the server arena.
+    // One method per htmx v4 response header. Each records the route's
+    // default for that header; per request it is sent unless a transformer
+    // set the same field (section 3.3). Values are copied into the server
+    // arena.
     pub fn trigger(self: *HtmxRoute, events: []const u8) *HtmxRoute; // HX-Trigger
     pub fn location(self: *HtmxRoute, path: []const u8) *HtmxRoute; // HX-Location
     pub fn redirect(self: *HtmxRoute, url: []const u8) *HtmxRoute; // HX-Redirect
@@ -439,25 +455,25 @@ pub const HtmxRoute = struct {
 };
 ```
 
-Per-request behaviour of the internal action, in order:
+Per-request behaviour, in order (`Handler.dispatch` drives it, so the
+per-request headers survive a failure):
 
-1. Build `zmpl.Data` from `.data()` entries (3.2).
-2. Render the chain (3.1) into `res.body`, `Content-Type: text/html`.
-3. `spec.hx.apply(res)`.
+1. `req_hx = htmx.Headers{}`: this request's header writes, initially empty.
+2. Build `zmpl.Data` from `.data()` entries (3.2). A transformer with an `hx`
+   parameter receives `&req_hx`. A transformer error stops here.
+3. Render the chain (3.1) into `res.body`, `Content-Type: text/html`.
+4. `spec.hx.overlay(req_hx).apply(res)`: route defaults, with every field a
+   transformer set replaced by the transformer's value (3.3).
 
 Headers are set whether or not the request carried `HX-Request`; a direct
 browser hit gets the same fragment plus harmless extra headers. Branching on
 htmx-ness belongs in middleware (section 6) or in the transformer.
 
-On error (a transformer cannot fail, so this means a render failure or a
-mapper-visible error from the context function): status from the mapper; body
-from `config.zmpl.error_templates` with `.error` set, else `text/plain`
-message. No hx headers are applied on the error path.
-
-Recorded values are static by design. A response that needs a per-request
-header value (a `pushUrl` containing an id) is an `.api()` route whose action
-renders through zmpl itself and builds an `htmx.Headers` inline; both paths
-write the header through the same struct.
+On error (a transformer returned one, the chain failed to render, or the
+context function surfaced one): status from the mapper; body from
+`config.zmpl.error_templates` with `.error` set, else `text/plain` message;
+then `req_hx.apply(res)` and nothing else. Route defaults are not sent with
+an error body. Section 3.3 gives the reasoning.
 
 ### 2.3 `.page()`: full-page render
 
@@ -473,9 +489,13 @@ pub const PageRoute = struct {
 
 `GET` only. `templates` uses the same chain semantics as `.htmx().templates`
 and is resolved at registration. The per-request action is the htmx one minus
-step 3. The brief wrote the parameter as a single string; it is a list here so
-that `.page` and `.htmx` share exactly one chain rule instead of a
-"one template, layout from config" special case.
+step 4, and `.data()` rejects a transformer that takes the `hx` parameter with
+a `@compileError`: a full page has no htmx response headers, and a transformer
+that reaches for them on a page route is a registration mistake, not a
+runtime no-op. The hx-less shapes are accepted unchanged, so one transformer
+can serve a `.page` and an `.htmx` route. The brief wrote the parameter as a
+single string; it is a list here so that `.page` and `.htmx` share exactly one
+chain rule instead of a "one template, layout from config" special case.
 
 ## 3. Shared conventions
 
@@ -500,30 +520,57 @@ the *first* layout. Layouts at index 2 and beyond receive `{{zmpl.content}}`
 only. Partials (`_name.zmpl`) are not valid chain members; zmpl rejects
 rendering a partial with a layout.
 
-### 3.2 `.data(key, transformer)` value convention
+### 3.2 `.data(key, transformer)` contract
 
-`T` is **any type that `zmpl.Data.Value.put` already accepts**: `[]const u8`,
-integer and float types, `bool`, enums (tag name), structs (field by field,
-recursively), slices and arrays of those, optionals, and `*zmpl.Data.Value`
-for hand-built objects or arrays. Reason: zmpl's public surface does have one
-universal value type (`Data.Value`) but constructing it requires a `*Data` the
-transformer would not have. Returning plain Zig values and letting zmpl's own
-`zmplValue` coercion run inside `put` keeps the transformer signature at
-`fn (req) ?T`, adds no second value model, and gives a compile error for
-unsupported types at the exact `put` site.
+**Shapes.** `.data()` accepts a function (or pointer to one) in any of four
+shapes, chosen at comptime from its parameter count and return type. With
+`App == void` the `app` parameter is absent; everything else is identical.
+
+```zig
+fn (app: App, req: *httpz.Request) ?T
+fn (app: App, req: *httpz.Request) !?T
+fn (app: App, req: *httpz.Request, hx: *zerb.htmx.Headers) ?T    // .htmx only
+fn (app: App, req: *httpz.Request, hx: *zerb.htmx.Headers) !?T   // .htmx only
+```
+
+Any other parameter list or return type (a bare `T`, `!T`, `anytype`, a
+different pointer type) is a `@compileError` naming the offending function.
+`Server.Transformer(T)` still names the first shape for code that stores a
+pointer.
+
+**Values.** `T` is **any type that `zmpl.Data.Value.put` already accepts**:
+`[]const u8`, integer and float types, `bool`, enums (tag name), structs
+(field by field, recursively), slices and arrays of those, optionals, and
+`*zmpl.Data.Value` for hand-built objects or arrays. Reason: zmpl's public
+surface does have one universal value type (`Data.Value`) but constructing it
+requires a `*Data` the transformer would not have. Returning plain Zig values
+and letting zmpl's own `zmplValue` coercion run inside `put` adds no second
+value model and gives a compile error for unsupported types at the exact `put`
+site. A header-only `.htmx` route (no templates) can return `?void`.
+
+**Errors.** A returned error aborts the render at that entry: later entries
+do not run, no template renders, and the error takes the same path as an
+action error (`dispatch`, then the mapper, then the error templates or
+`text/plain`). `error.NotFound` is a 404 and `error.BadRequest` a 400 on both
+`.htmx` and `.page` routes; a custom mapper sees the error exactly as it would
+from an `.api` action. This is how "unknown id" becomes a 404 instead of a
+`ZmplUnknownDataReferenceError` 500 from a template that dereferences a
+missing key.
 
 Per request the library does:
 
 ```zig
-fn buildData(spec: *const RouteSpec, app: App, req: *httpz.Request) !zmpl.Data {
+fn buildData(spec: *const RouteSpec, app: App, req: *httpz.Request, hx: *htmx.Headers) !zmpl.Data {
     var d = zmpl.Data.init(spec.server.io, req.arena);
     const root = try d.object();
-    for (spec.data.items) |entry| try entry.apply(app, req, root);
+    for (spec.data.items) |entry| try entry.apply(app, req, hx, root);
     return d;
 }
 ```
 
-where the generated `apply` is `if (transformer(app, req)) |v| try root.put(key, v);`.
+where the generated `apply` calls the transformer with the parameters its
+shape declares, `try`s the result if the shape is fallible, and does
+`if (maybe) |v| try root.put(key, v);`.
 
 Rules that follow:
 
@@ -534,6 +581,64 @@ Rules that follow:
   zerb, so the render output stays valid until httpz writes the response and
   the request arena is reset.
 - `error` is reserved for the error-template path.
+- Transformers are also where side effects happen on `.htmx` routes (there
+  is no separate action stage). Order them accordingly: an entry that fails
+  prevents the ones after it from running, not the ones before.
+
+### 3.3 Per-request htmx headers
+
+A transformer on an `.htmx` route may take `hx: *zerb.htmx.Headers`. It is
+the request's own `Headers` value, shared by every transformer of that
+request, and it starts **empty**, not as a copy of the route's recorded
+headers. Writes are plain field assignments:
+
+```zig
+fn toggleTodo(app: *App, req: *httpz.Request, hx: *zerb.htmx.Headers) !?View {
+    const id = std.fmt.parseInt(u32, req.param("id") orelse return error.BadRequest, 10) catch
+        return error.BadRequest;
+    const todo = app.toggle(id) orelse {
+        hx.retarget = "#errors";
+        return error.NotFound;
+    };
+    if (!todo.changed) hx.reswap = "none";
+    hx.trigger = try std.fmt.allocPrint(req.arena, "{{\"todos:changed\":{{\"id\":{d}}}}}", .{id});
+    return View.of(todo);
+}
+```
+
+**Precedence (success).** The response gets `route.hx.overlay(req_hx)`: for
+each header field, the transformer's value if any transformer set it, else
+the route's recorded default. Between transformers the later write wins,
+mirroring the rule for `.data` keys. Headers are applied exactly once, after
+the chain renders. Two consequences of "starts empty":
+
+- A transformer cannot *unset* a route default (there is no "set to null"
+  distinct from "did not touch"). If a header must sometimes be absent, do
+  not record it on the route; set it from the transformer when it applies.
+- A transformer cannot read the route default through `hx`. It can read what
+  earlier transformers of the same request wrote.
+
+**Precedence (failure).** Only `req_hx` is applied, after the error body;
+route defaults are not. htmx 4 swaps 4xx/5xx bodies by default, so a route's
+`.reswap("outerHTML")`/`.retarget("closest tr")` would put the error page
+where the row was. What the transformer wrote before returning the error is
+sent, so `hx.retarget = "#errors"` followed by `return error.BadRequest`
+lands the error fragment in the slot it named. The same rule covers a chain
+that fails to render after the transformers ran.
+
+Why "starts empty" rather than "starts as a copy of the defaults": the copy
+would need a per-field "was this written this request" record to implement
+the failure rule, and plain field assignment cannot maintain one. Diffing the
+final value against the default instead would misclassify a transformer that
+deliberately set a header to the same value as the default. Starting empty
+makes `req_hx` exactly the set of per-request writes, so both rules are
+literal: success is an overlay, failure is `req_hx` alone.
+
+**Ownership.** `Headers.apply` hands the slices to `res.header` without
+copying. A value written from a transformer must therefore be a string
+literal, live in the server arena, or be allocated in `req.arena` (or
+`res.arena`); both arenas outlive the response write. A slice into a
+transformer's stack frame is a use-after-return.
 
 ## 4. httpz passthrough
 
@@ -672,10 +777,11 @@ pub fn main(init: std.process.Init) !void {
     try server.api(.GET, "/api/users/:id", getUser, .{});
 
     // .htmx(): fragment "users/row" (no layout), swapped over the caller's
-    // row, then a client event fires.
+    // row, then a client event fires. `renameUser` overrides the recorded
+    // HX-Trigger per request and returns error.NotFound for an unknown id.
     _ = (try server.htmx(.POST, "/users/:id/rename", .{}))
         .templates(&.{"users/row"})
-        .data("user", loadUser)
+        .data("user", renameUser)
         .retarget("closest tr")
         .reswap("outerHTML")
         .trigger("user:renamed");
@@ -694,9 +800,20 @@ fn getUser(app: *App, req: *httpz.Request, res: *httpz.Response) !void {
     try res.json(user, .{});
 }
 
-fn loadUser(app: *App, req: *httpz.Request) ?User {
-    const id = req.param("id") orelse return null;
-    return app.find(id);
+fn loadUser(app: *App, req: *httpz.Request) !?User {
+    const id = req.param("id") orelse return error.BadRequest;
+    return app.find(id) orelse error.NotFound;
+}
+
+fn renameUser(app: *App, req: *httpz.Request, hx: *zerb.htmx.Headers) !?User {
+    const id = req.param("id") orelse return error.BadRequest;
+    const user = app.find(id) orelse {
+        hx.retarget = "#errors";
+        hx.reswap = "innerHTML";
+        return error.NotFound;
+    };
+    hx.trigger = try std.fmt.allocPrint(req.arena, "{{\"user:renamed\":{{\"id\":\"{s}\"}}}}", .{id});
+    return user;
 }
 
 fn greeting(app: *App, req: *httpz.Request) ?[]const u8 {
@@ -745,13 +862,16 @@ changes with it.
 7. **`.page(templates)` takes a list**, not the brief's single string, so both
    template routes share one chain rule and there is no "default layout" knob.
 8. **`.data()` `T` is "anything `Value.put` accepts"**, inferred from the
-   transformer's `?T` return type; `null` omits the key; later duplicates win;
-   strings are not copied.
+   transformer's `?T` or `!?T` return type; `null` omits the key; an error
+   aborts the render and is mapped like an action error; later duplicates
+   win; strings are not copied.
 9. **Templates resolve at registration and panic on a miss**, matching
    httpz's `router.get` convention, with `tryTemplates` as the error form.
-10. **Recorded hx header values are static.** Dynamic values go through
-    `htmx.Headers` inside an `.api` action; there is no per-request callback on
-    the builder.
+10. **Recorded hx header values are per-route defaults; per-request values
+    come from transformers.** A transformer may take `hx: *htmx.Headers`
+    (`.htmx` routes only, `@compileError` on `.page`). The handle starts
+    empty; on success it is overlaid on the defaults, on failure it is the
+    only thing sent. No setter methods on `Headers` (field/method name clash).
 11. **hx headers are always applied**, even without `HX-Request`; a route with
     no templates sends an empty body plus headers.
 12. **Routes register immediately** and builders mutate the spec in place
