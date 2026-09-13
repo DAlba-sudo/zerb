@@ -58,6 +58,11 @@ pub const Request = struct {
 /// send". Values are raw header strings: `reswap` takes the full swap spec
 /// (`"outerHTML show:top"`), `trigger` takes an event name or the JSON object
 /// form, `push_url`/`replace_url` accept `"false"`.
+///
+/// Two places write into it: the `.htmx()` route builder (recorded once, for
+/// every request) and a transformer that takes a `*Headers` parameter (per
+/// request, see `Server.Transformer`). Strings are never copied here, so a
+/// per-request value must be static or allocated in `req.arena`.
 pub const Headers = struct {
     trigger: ?[]const u8 = null, // HX-Trigger
     location: ?[]const u8 = null, // HX-Location
@@ -81,6 +86,22 @@ pub const Headers = struct {
         if (self.reselect) |v| res.header("HX-Reselect", v);
         if (self.push_url) |v| res.header("HX-Push-Url", v);
         if (self.replace_url) |v| res.header("HX-Replace-Url", v);
+    }
+
+    /// `base` with every field that is set in `over` replaced by `over`'s
+    /// value. Fields `over` leaves at `null`/`false` keep `base`'s value.
+    /// This is the per-request merge rule: route defaults as `base`,
+    /// transformer writes as `over`.
+    pub fn overlay(base: Headers, over: Headers) Headers {
+        var out = base;
+        inline for (std.meta.fields(Headers)) |f| {
+            if (comptime f.type == bool) {
+                if (@field(over, f.name)) @field(out, f.name) = true;
+            } else {
+                if (@field(over, f.name)) |v| @field(out, f.name) = v;
+            }
+        }
+        return out;
     }
 };
 
@@ -133,6 +154,19 @@ test "htmx.Headers: apply emits only set fields" {
     try ht.expectHeader("HX-Redirect", null);
     try ht.expectHeader("HX-Reselect", null);
     try ht.expectHeader("HX-Replace-Url", null);
+}
+
+test "htmx.Headers: overlay keeps base fields the override leaves unset" {
+    const base = Headers{ .trigger = "base", .reswap = "outerHTML", .refresh = false };
+    const over = Headers{ .trigger = "over", .retarget = "#x", .refresh = true };
+    const merged = base.overlay(over);
+    try std.testing.expectEqualStrings("over", merged.trigger.?);
+    try std.testing.expectEqualStrings("outerHTML", merged.reswap.?);
+    try std.testing.expectEqualStrings("#x", merged.retarget.?);
+    try std.testing.expect(merged.refresh);
+    try std.testing.expectEqual(null, merged.push_url);
+    // An empty override is the identity.
+    try std.testing.expectEqualStrings("base", base.overlay(.{}).trigger.?);
 }
 
 test "htmx.Headers: empty applies nothing" {
